@@ -99,7 +99,7 @@ struct SettingsSheet: View {
                             
                             Picker("Język Mowy", selection: $speechManager.sourceLanguage) {
                                 ForEach(languages, id: \.0) { code, name in
-                                    Text(name).tag(code)
+                                    Text(name).tag(code as String)
                                 }
                             }
                             .pickerStyle(SegmentedPickerStyle())
@@ -114,7 +114,7 @@ struct SettingsSheet: View {
                             
                             Picker("Język Tłumaczenia", selection: $speechManager.targetLanguage) {
                                 ForEach(languages, id: \.0) { code, name in
-                                    Text(name).tag(code)
+                                    Text(name).tag(code as String)
                                 }
                             }
                             .pickerStyle(SegmentedPickerStyle())
@@ -291,7 +291,7 @@ struct ContentView: View {
                             }
                             
                             // RESET/TRASH BUTTON
-                            Button(action: {
+                            Button(action: { () -> Void in
                                 withAnimation {
                                     speechManager.reset()
                                 }

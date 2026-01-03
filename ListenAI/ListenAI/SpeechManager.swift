@@ -10,14 +10,12 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
         didSet {
             if oldValue != sourceLanguage {
                 setupRecognizer(localeID: mapLanguageToLocale(sourceLanguage))
-                // Send update to server immediately
                 sendToBackend(text: transcript)
             }
         }
     }
     @Published var targetLanguage: String = "pl" {
         didSet {
-            // Send update to server
             sendToBackend(text: transcript)
         }
     }
@@ -30,7 +28,12 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
     private let synthesizer = AVSpeechSynthesizer()
     
     // Data Persistence
-    private var committedTranscript: String = ""
+    private var history: [String] = [] {
+        didSet {
+            saveHistory()
+        }
+    }
+    private var currentLiveText: String = ""
     
     @Published var transcript: String = ""
     @Published var isRecording: Bool = false
@@ -53,20 +56,30 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
     
     override init() {
         super.init()
+        loadHistory() // Load saved text on launch
         synthesizer.delegate = self
-        setupRecognizer(localeID: "en-US") // Default per request
+        setupRecognizer(localeID: "en-US")
         requestAuthorization()
+        updateTranscript() // Show loaded text immediately
+    }
+    
+    private func saveHistory() {
+        UserDefaults.standard.set(history, forKey: "transcriptHistory")
+    }
+    
+    private func loadHistory() {
+        if let saved = UserDefaults.standard.stringArray(forKey: "transcriptHistory") {
+            history = saved
+        }
     }
     
     private func setupRecognizer(localeID: String) {
-        // Stop any current recording first
         if isRecording {
             stopRecording()
         }
         
         speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: localeID))
         speechRecognizer?.delegate = self
-        print("Speech Recognizer set to: \(localeID)")
     }
     
     private func mapLanguageToLocale(_ lang: String) -> String {
@@ -84,29 +97,55 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
                 switch authStatus {
-                case .authorized:
-                    break
-                case .denied:
-                    self.errorMessage = "Odmówiono dostępu do rozpoznawania mowy."
-                case .restricted:
-                    self.errorMessage = "Rozpoznawanie mowy jest ograniczone na tym urządzeniu."
-                case .notDetermined:
-                    self.errorMessage = "Nie ustalono uprawnień."
-                @unknown default:
-                    self.errorMessage = "Nieznany błąd uprawnień."
+                case .authorized: break
+                case .denied: self.errorMessage = "Odmówiono dostępu do rozpoznawania mowy."
+                case .restricted: self.errorMessage = "Rozpoznawanie mowy jest ograniczone na tym urządzeniu."
+                case .notDetermined: self.errorMessage = "Nie ustalono uprawnień."
+                @unknown default: self.errorMessage = "Nieznany błąd uprawnień."
                 }
             }
         }
     }
     
+    // MARK: - State Management (Main Thread) 
+    
+    private func commitCurrentText() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.commitCurrentText() }
+            return
+        }
+        
+        if !currentLiveText.isEmpty {
+            history.append(currentLiveText)
+            currentLiveText = ""
+            updateTranscript()
+        }
+    }
+    
+    private func updateTranscript() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.updateTranscript() }
+            return
+        }
+        
+        let allSegments = history + (currentLiveText.isEmpty ? [] : [currentLiveText])
+        self.transcript = allSegments.joined(separator: "\n\n")
+        self.sendToBackend(text: self.transcript)
+    }
+    
     func startRecording() {
+        DispatchQueue.main.async {
+            self._startRecordingInternal()
+        }
+    }
+    
+    private func _startRecordingInternal() {
+        commitCurrentText()
+        
         if recognitionTask != nil {
             recognitionTask?.cancel()
             recognitionTask = nil
         }
-        
-        // Save current transcript as the base for the new session
-        committedTranscript = transcript
         
         let audioSession = AVAudioSession.sharedInstance()
         do {
@@ -118,8 +157,8 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
         }
         
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        
         let inputNode = audioEngine.inputNode
+        
         guard let recognitionRequest = recognitionRequest else {
             errorMessage = "Nie można utworzyć żądania rozpoznawania."
             return
@@ -133,30 +172,31 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
             }
         }
         
-        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { result, error in
+        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+            guard let self = self else { return }
+            
             var isFinal = false
             
             if let result = result {
-                let liveText = result.bestTranscription.formattedString
-                
-                // Combine committed text with live text
-                if self.committedTranscript.isEmpty {
-                    self.transcript = liveText
-                } else {
-                    self.transcript = self.committedTranscript + " " + liveText
+                DispatchQueue.main.async {
+                    self.currentLiveText = result.bestTranscription.formattedString
+                    self.updateTranscript()
                 }
-                
-                self.sendToBackend(text: self.transcript)
                 isFinal = result.isFinal
             }
             
             if error != nil || isFinal {
                 self.audioEngine.stop()
                 inputNode.removeTap(onBus: 0)
+                
                 self.recognitionRequest = nil
                 self.recognitionTask = nil
-                self.isRecording = false
+                
                 DispatchQueue.main.async {
+                    self.isRecording = false
+                    if isFinal {
+                        self.commitCurrentText()
+                    }
                     self.audioLevel = 0.0
                 }
             }
@@ -165,15 +205,11 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
             self.recognitionRequest?.append(buffer)
-            
             guard let channelData = buffer.floatChannelData?[0] else { return }
             let frameLength = UInt(buffer.frameLength)
-            
             var rms: Float = 0
             vDSP_rmsqv(channelData, 1, &rms, frameLength)
-            
-            let normalized = min(max(rms * 10, 0), 1) // Boost sensitivity
-            
+            let normalized = min(max(rms * 10, 0), 1)
             DispatchQueue.main.async {
                 self.audioLevel = normalized
             }
@@ -193,20 +229,23 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
     func stopRecording() {
         audioEngine.stop()
         recognitionRequest?.endAudio()
-        isRecording = false
-        audioLevel = 0.0
         
-        // Update committed transcript one last time to be sure
-        committedTranscript = transcript
-        
-        speak(text: transcript)
+        DispatchQueue.main.async {
+            self.isRecording = false
+            self.audioLevel = 0.0
+            self.commitCurrentText()
+            self.speak(text: self.transcript)
+        }
     }
     
     func reset() {
-        transcript = ""
-        committedTranscript = ""
-        audioLevel = 0.0
-        sendToBackend(text: "")
+        DispatchQueue.main.async {
+            self.transcript = ""
+            self.history = [] // This triggers didSet -> saveHistory (clears UserDefaults)
+            self.currentLiveText = ""
+            self.audioLevel = 0.0
+            self.sendToBackend(text: "")
+        }
     }
     
     func speak(text: String) {
