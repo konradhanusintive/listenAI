@@ -98,10 +98,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
 
         @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
-        /* Smooth appearing */
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .block.new { animation: fadeIn 0.3s ease forwards; }
-
         /* Fullscreen */
         #fs { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 100; display: none; padding: 50px 10vw; box-sizing: border-box; overflow-y: auto; }
         #fs-content { font-size: 2.8rem; line-height: 1.4; color: #fff; margin: auto 0; }
@@ -139,7 +135,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
     let cache = { blocks: [], translations: [] };
 
     function scrollToBottom(el) {
-        // Smart scroll: only if near bottom
         if (el.scrollHeight - el.scrollTop - el.clientHeight < 150) {
             el.scrollTop = el.scrollHeight;
         }
@@ -162,7 +157,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
 
             const fullText = data.text || "";
             
-            // Handle Hard Reset
             if (fullText === "" && cache.blocks.length > 0) {
                 boxSource.innerHTML = "";
                 boxTarget.innerHTML = "";
@@ -172,7 +166,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
 
             const newBlocks = fullText.split(/\n\n+/).filter(x => x.trim().length > 0);
 
-            // Update UI
             for (let i = 0; i < newBlocks.length; i++) {
                 const text = newBlocks[i];
                 
@@ -181,23 +174,16 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
                 if (!sEl) {
                     sEl = document.createElement('div');
                     sEl.id = `s-${i}`;
-                    sEl.className = 'block source new';
+                    sEl.className = 'block source';
                     boxSource.appendChild(sEl);
                     scrollToBottom(boxSource);
                 }
 
-                // Smart Append (Typewriter)
-                // If text is longer than current innerText, append.
-                // If text differs entirely (correction), replace.
-                const currentText = sEl.dataset.fullText || ""; // use dataset for cleaner logic
-                
+                const currentText = sEl.dataset.fullText || "";
                 if (text !== currentText) {
                     sEl.dataset.fullText = text;
-                    
                     if (text.startsWith(currentText)) {
-                        const chunk = text.substring(currentText.length);
-                        // Simply append, no fancy typing loop to avoid jumping
-                        sEl.innerText += chunk; 
+                        sEl.innerText += text.substring(currentText.length);
                     } else {
                         sEl.innerText = text;
                     }
@@ -205,7 +191,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
                 }
 
                 // 2. Target
-                // Only translate if changed
                 if (cache.blocks[i] !== text || !cache.translations[i]) {
                     cache.blocks[i] = text;
                     
@@ -213,13 +198,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
                     if (!tEl) {
                         tEl = document.createElement('div');
                         tEl.id = `t-${i}`;
-                        tEl.className = 'block target new';
+                        tEl.className = 'block target';
                         tEl.innerText = "...";
                         boxTarget.appendChild(tEl);
                         scrollToBottom(boxTarget);
                     }
                     
-                    translateBlock(text, i);
+                    translateLongText(text, i);
                 }
             }
 
@@ -230,24 +215,52 @@ if (isset($_GET['action']) && $_GET['action'] === 'fetch') {
         setTimeout(loop, 500);
     }
 
-    async function translateBlock(text, index) {
+    // Helper to split text by chunks (approx 450 chars) but respecting words
+    function splitToChunks(text, limit = 450) {
+        if (text.length <= limit) return [text];
+        const words = text.split(" ");
+        const chunks = [];
+        let currentChunk = "";
+        
+        for (const word of words) {
+            if ((currentChunk + word).length > limit) {
+                chunks.push(currentChunk.trim());
+                currentChunk = word + " ";
+            } else {
+                currentChunk += word + " ";
+            }
+        }
+        if (currentChunk.trim()) chunks.push(currentChunk.trim());
+        return chunks;
+    }
+
+    async function translateLongText(text, index) {
         const tEl = document.getElementById(`t-${index}`);
         const pair = `${config.source}|${config.target}`;
         
+        const chunks = splitToChunks(text);
+        let translatedParts = [];
+
         try {
-            const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${pair}`;
-            const res = await fetch(url);
-            const json = await res.json();
-            
-            if (json.responseData) {
-                const trans = json.responseData.translatedText;
-                cache.translations[index] = trans;
-                tEl.innerText = trans;
-                updateFullscreen();
-                scrollToBottom(boxTarget);
-            }
+            // Process chunks in parallel
+            const promises = chunks.map(async (chunk) => {
+                const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=${pair}`;
+                const res = await fetch(url);
+                const json = await res.json();
+                return json.responseData ? json.responseData.translatedText : chunk;
+            });
+
+            const results = await Promise.all(promises);
+            const fullTranslation = results.join(" ");
+
+            cache.translations[index] = fullTranslation;
+            tEl.innerText = fullTranslation;
+            updateFullscreen();
+            scrollToBottom(boxTarget);
+
         } catch (e) {
-            // silent fail
+            console.error(e);
+            tEl.innerText = "[Błąd limitu API]";
         }
     }
 
