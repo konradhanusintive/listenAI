@@ -29,6 +29,9 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
     private let audioEngine = AVAudioEngine()
     private let synthesizer = AVSpeechSynthesizer()
     
+    // Data Persistence
+    private var committedTranscript: String = ""
+    
     @Published var transcript: String = ""
     @Published var isRecording: Bool = false
     @Published var errorMessage: String?
@@ -102,6 +105,9 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
             recognitionTask = nil
         }
         
+        // Save current transcript as the base for the new session
+        committedTranscript = transcript
+        
         let audioSession = AVAudioSession.sharedInstance()
         do {
             try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
@@ -131,9 +137,16 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
             var isFinal = false
             
             if let result = result {
-                let newTranscript = result.bestTranscription.formattedString
-                self.transcript = newTranscript
-                self.sendToBackend(text: newTranscript)
+                let liveText = result.bestTranscription.formattedString
+                
+                // Combine committed text with live text
+                if self.committedTranscript.isEmpty {
+                    self.transcript = liveText
+                } else {
+                    self.transcript = self.committedTranscript + " " + liveText
+                }
+                
+                self.sendToBackend(text: self.transcript)
                 isFinal = result.isFinal
             }
             
@@ -183,11 +196,15 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
         isRecording = false
         audioLevel = 0.0
         
+        // Update committed transcript one last time to be sure
+        committedTranscript = transcript
+        
         speak(text: transcript)
     }
     
     func reset() {
         transcript = ""
+        committedTranscript = ""
         audioLevel = 0.0
         sendToBackend(text: "")
     }
