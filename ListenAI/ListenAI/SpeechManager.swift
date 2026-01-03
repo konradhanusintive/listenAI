@@ -2,9 +2,28 @@ import Foundation
 import Speech
 import AVFoundation
 import SwiftUI
+import Accelerate
 
 class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVSpeechSynthesizerDelegate {
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "pl-PL")) // Polish locale based on user language
+    // Localization
+    @Published var sourceLanguage: String = "en" {
+        didSet {
+            if oldValue != sourceLanguage {
+                setupRecognizer(localeID: mapLanguageToLocale(sourceLanguage))
+                // Send update to server immediately
+                sendToBackend(text: transcript)
+            }
+        }
+    }
+    @Published var targetLanguage: String = "pl" {
+        didSet {
+            // Send update to server
+            sendToBackend(text: transcript)
+        }
+    }
+    
+    // Core Audio & Speech
+    private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private let audioEngine = AVAudioEngine()
@@ -13,12 +32,49 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
     @Published var transcript: String = ""
     @Published var isRecording: Bool = false
     @Published var errorMessage: String?
+    @Published var audioLevel: Float = 0.0
+    
+    // Server settings
+    private let serverURL = URL(string: "https://reactblog.pl/listen-ai/index.php")!
+    private var lastSendTime: Date = Date()
+    private var sendWorkItem: DispatchWorkItem?
+    
+    // Connection status
+    @Published var connectionStatus: String = "Oczekiwanie"
+    @Published var isConnected: Bool = false
+    
+    // Voice settings (TTS)
+    @Published var pitch: Float = 1.0
+    @Published var rate: Float = 0.5
+    @Published var volume: Float = 1.0
     
     override init() {
         super.init()
-        speechRecognizer?.delegate = self
         synthesizer.delegate = self
+        setupRecognizer(localeID: "en-US") // Default per request
         requestAuthorization()
+    }
+    
+    private func setupRecognizer(localeID: String) {
+        // Stop any current recording first
+        if isRecording {
+            stopRecording()
+        }
+        
+        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: localeID))
+        speechRecognizer?.delegate = self
+        print("Speech Recognizer set to: \(localeID)")
+    }
+    
+    private func mapLanguageToLocale(_ lang: String) -> String {
+        switch lang {
+        case "pl": return "pl-PL"
+        case "en": return "en-US"
+        case "de": return "de-DE"
+        case "es": return "es-ES"
+        case "fr": return "fr-FR"
+        default: return "en-US"
+        }
     }
     
     private func requestAuthorization() {
@@ -65,7 +121,6 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
         
         recognitionRequest.shouldReportPartialResults = true
         
-        // Keep the speech recognition data on device for privacy and speed if available (iOS 13+)
         if #available(iOS 13, *) {
             if speechRecognizer?.supportsOnDeviceRecognition ?? false {
                 recognitionRequest.requiresOnDeviceRecognition = true
@@ -76,12 +131,10 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
             var isFinal = false
             
             if let result = result {
-                self.transcript = result.bestTranscription.formattedString
+                let newTranscript = result.bestTranscription.formattedString
+                self.transcript = newTranscript
+                self.sendToBackend(text: newTranscript)
                 isFinal = result.isFinal
-                
-                // Real-time TTS trigger could go here if "immediately" means echoing words,
-                // but usually that creates a feedback loop.
-                // We will stick to STT for now as per "pisze" (writes).
             }
             
             if error != nil || isFinal {
@@ -90,12 +143,27 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
                 self.recognitionRequest = nil
                 self.recognitionTask = nil
                 self.isRecording = false
+                DispatchQueue.main.async {
+                    self.audioLevel = 0.0
+                }
             }
         }
         
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
             self.recognitionRequest?.append(buffer)
+            
+            guard let channelData = buffer.floatChannelData?[0] else { return }
+            let frameLength = UInt(buffer.frameLength)
+            
+            var rms: Float = 0
+            vDSP_rmsqv(channelData, 1, &rms, frameLength)
+            
+            let normalized = min(max(rms * 10, 0), 1) // Boost sensitivity
+            
+            DispatchQueue.main.async {
+                self.audioLevel = normalized
+            }
         }
         
         audioEngine.prepare()
@@ -113,23 +181,73 @@ class SpeechManager: NSObject, ObservableObject, SFSpeechRecognizerDelegate, AVS
         audioEngine.stop()
         recognitionRequest?.endAudio()
         isRecording = false
+        audioLevel = 0.0
         
-        // Auto-speak functionality if desired "zamienia tekst na mowę" after listening
         speak(text: transcript)
+    }
+    
+    func reset() {
+        transcript = ""
+        audioLevel = 0.0
+        sendToBackend(text: "")
     }
     
     func speak(text: String) {
         guard !text.isEmpty else { return }
         
-        // Ensure audio session is set to playback for speaking
         let audioSession = AVAudioSession.sharedInstance()
         try? audioSession.setCategory(.playback, mode: .default)
         try? audioSession.setActive(true)
 
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: "pl-PL")
-        utterance.rate = 0.5
+        utterance.voice = AVSpeechSynthesisVoice(language: mapLanguageToLocale(sourceLanguage))
+        utterance.pitchMultiplier = pitch
+        utterance.rate = rate
+        utterance.volume = volume
         
         synthesizer.speak(utterance)
+    }
+    
+    private func sendToBackend(text: String) {
+        sendWorkItem?.cancel()
+        
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            
+            DispatchQueue.main.async {
+                self.connectionStatus = "Wysyłanie..."
+            }
+            
+            var request = URLRequest(url: self.serverURL)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = 5
+            
+            let body: [String: Any] = [
+                "text": text,
+                "sourceLang": self.sourceLanguage,
+                "targetLang": self.targetLanguage
+            ]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body, options: [])
+            
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                DispatchQueue.main.async {
+                    if let error = error {
+                        print("Błąd wysyłania: \(error.localizedDescription)")
+                        self.connectionStatus = "Błąd sieci"
+                        self.isConnected = false
+                    } else if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                        self.connectionStatus = "Wysłano"
+                        self.isConnected = true
+                    } else {
+                        self.connectionStatus = "Błąd serwera"
+                        self.isConnected = false
+                    }
+                }
+            }.resume()
+        }
+        
+        sendWorkItem = workItem
+        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 0.5, execute: workItem)
     }
 }
